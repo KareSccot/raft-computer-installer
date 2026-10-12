@@ -52,7 +52,11 @@ jobs:
           mode = 'full' if os.environ['FULL'] == 'true' else 'candidate' if candidate else 'latest' if event == 'schedule' else 'control'
           if event in ('push', 'pull_request') and mode == 'control':
               base = os.environ.get('BASE', '')
-              if base and set(base) != {'0'}:
+              # A force push's `before` may be a commit the repository no longer
+              # has; then there is nothing to compare, so keep full control coverage.
+              known = base and set(base) != {'0'} and subprocess.run(
+                  ['git', 'cat-file', '-e', base + '^{commit}'], capture_output=True).returncode == 0
+              if known:
                   paths = subprocess.check_output(['git', 'diff', '--name-only', base, 'HEAD'], text=True).splitlines()
                   if paths and all(p.endswith('.md') for p in paths):
                       mode = 'none'
