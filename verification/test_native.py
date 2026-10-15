@@ -1364,6 +1364,31 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((plain.home / "fixture-setup").exists())
 
+    @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
+    def test_bootstrap_setup_connects_with_the_installed_version_when_the_upgrade_does_not_complete(self):
+        # The connect dialog's command on a machine that already runs Raft
+        # Computer for another server: the upgrade rolls back (1.2.0 cannot
+        # start), but the command is for connecting, so setup still runs with
+        # the version that is installed, and the command succeeds.
+        extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.login_start()
+        result = machine.run(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True, extra=extra)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("==> Connecting with the Raft Computer already on this machine", output)
+        self.assertEqual(machine.live()["version"], "1.0.0")
+        self.assertEqual((machine.home / "fixture-setup").read_text(), "/my-server")
+        # Setup runs exactly when a working Raft Computer is left installed; a
+        # first install that leaves none keeps the installer's failure.
+        fresh = self.machine()
+        result = fresh.run(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True, extra=extra)
+        works = fresh.binary.exists() and subprocess.run(
+            [str(fresh.binary), "--version"], env=fresh.env(extra), capture_output=True, timeout=60).returncode == 0
+        self.assertEqual((fresh.home / "fixture-setup").exists(), works, result.stdout + result.stderr)
+        self.assertEqual(result.returncode == 0, works, result.stdout + result.stderr)
+
     @unittest.skipUnless(WINDOWS, "install.ps1 is the Windows entry script")
     def test_windows_entry_script_setup_by_argument_and_by_env(self):
         extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
