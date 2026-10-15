@@ -1390,6 +1390,26 @@ class InstallerContract(unittest.TestCase):
         self.assertEqual(result.returncode == 0, works, result.stdout + result.stderr)
 
     @unittest.skipUnless(WINDOWS, "install.ps1 is the Windows entry script")
+    def test_windows_entry_script_setup_connects_with_the_installed_version_when_the_upgrade_does_not_complete(self):
+        # install.ps1's twin of the install.sh test above.
+        extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.login_start()
+        result = machine.run(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True, extra=extra)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("==> Connecting with the Raft Computer already on this machine", output)
+        self.assertEqual(machine.live()["version"], "1.0.0")
+        self.assertEqual((machine.home / "fixture-setup").read_text(), "/my-server")
+        fresh = self.machine()
+        result = fresh.run(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True, extra=extra)
+        works = fresh.binary.exists() and subprocess.run(
+            [str(fresh.binary), "--version"], env=fresh.env(extra), capture_output=True, timeout=60).returncode == 0
+        self.assertEqual((fresh.home / "fixture-setup").exists(), works, result.stdout + result.stderr)
+        self.assertEqual(result.returncode == 0, works, result.stdout + result.stderr)
+
+    @unittest.skipUnless(WINDOWS, "install.ps1 is the Windows entry script")
     def test_windows_entry_script_setup_by_argument_and_by_env(self):
         extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
         # Run as a file: everything after --setup goes to setup.
