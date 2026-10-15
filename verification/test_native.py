@@ -8,6 +8,7 @@ import select
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 import unittest
 import urllib.parse
@@ -1363,6 +1364,56 @@ class InstallerContract(unittest.TestCase):
         result = plain.run(["--version", "1.0.0"], bootstrap=True, extra=extra)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((plain.home / "fixture-setup").exists())
+
+    @unittest.skipIf(WINDOWS, "install.sh is the POSIX entry script")
+    def test_bootstrap_setup_connects_with_the_installed_version_when_the_upgrade_does_not_complete(self):
+        # The connect dialog's command on a machine that already runs Raft
+        # Computer for another server: the upgrade rolls back (1.2.0 cannot
+        # start), but the command is for connecting, so setup still runs with
+        # the version that is installed, and the command succeeds.
+        extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.login_start()
+        result = machine.run(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True, extra=extra)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("==> Connecting with the Raft Computer already on this machine", output)
+        self.assertEqual(machine.live()["version"], "1.0.0")
+        self.assertEqual((machine.home / "fixture-setup").read_text(), "/my-server")
+        # Setup runs exactly when a working Raft Computer is left installed; a
+        # first install that leaves none keeps the installer's failure.
+        fresh = self.machine()
+        result = fresh.run(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True, extra=extra)
+        works = fresh.binary.exists() and subprocess.run(
+            [str(fresh.binary), "--version"], env=fresh.env(extra), capture_output=True, timeout=60).returncode == 0
+        self.assertEqual((fresh.home / "fixture-setup").exists(), works, result.stdout + result.stderr)
+        self.assertEqual(result.returncode == 0, works, result.stdout + result.stderr)
+
+    @unittest.skipUnless(WINDOWS, "install.ps1 is the Windows entry script")
+    def test_windows_entry_script_setup_connects_with_the_installed_version_when_the_upgrade_does_not_complete(self):
+        # install.ps1's twin of the install.sh test above.
+        extra = {"RAFT_COMPUTER_INSTALLER_RELEASE_BASE": self.server.base + "/installer"}
+        machine = self.machine()
+        machine.json(["install", "--version", "1.0.0"])
+        machine.login_start()
+        # The rollback restarts the 1.0.0 service, which would inherit captured
+        # pipes and keep the capture from ever returning; capture to a file.
+        with tempfile.TemporaryFile("w+") as log:
+            result = subprocess.run(machine.command(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True),
+                env=machine.env(extra), text=True, stdout=log, stderr=subprocess.STDOUT, timeout=180)
+            log.seek(0)
+            output = log.read()
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("==> Connecting with the Raft Computer already on this machine", output)
+        self.assertEqual(machine.live()["version"], "1.0.0")
+        self.assertEqual((machine.home / "fixture-setup").read_text(), "/my-server")
+        fresh = self.machine()
+        result = fresh.run(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True, extra=extra)
+        works = fresh.binary.exists() and subprocess.run(
+            [str(fresh.binary), "--version"], env=fresh.env(extra), capture_output=True, timeout=60).returncode == 0
+        self.assertEqual((fresh.home / "fixture-setup").exists(), works, result.stdout + result.stderr)
+        self.assertEqual(result.returncode == 0, works, result.stdout + result.stderr)
 
     @unittest.skipUnless(WINDOWS, "install.ps1 is the Windows entry script")
     def test_windows_entry_script_setup_by_argument_and_by_env(self):

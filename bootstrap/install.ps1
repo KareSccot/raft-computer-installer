@@ -179,6 +179,17 @@ try {
       $env:Path = if ($env:Path) { "$installedDir;$env:Path" } else { $installedDir }
     }
   }
+  # An upgrade that was refused, rolled back or left for later still leaves a
+  # working Raft Computer (the installer has already said why). Connecting is
+  # what --setup is for, so do it with the version that is there; without one
+  # (a first install that failed) the installer's exit stands. As install.sh.
+  if ($code -ne 0 -and $null -ne $setupArgs -and (Test-Path -LiteralPath $installed)) {
+    & $installed --version *> $null
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host '==> Connecting with the Raft Computer already on this machine'
+      $code = 0
+    }
+  }
   if ($code -eq 0 -and $null -ne $setupArgs) {
     Write-Host '==> Setting up Raft Computer'
     & $installed setup @setupArgs

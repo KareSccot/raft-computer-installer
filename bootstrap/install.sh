@@ -12,7 +12,8 @@ INSTALL_CHANNEL_DEFAULT=""
 : "${RAFT_COMPUTER_INSTALLER_DL_BASE:=https://hands.build/dl/raft-computer-installer}"
 err() { printf 'Could not start the installation: %s.\n' "$1" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || err "$1 is required"; }
-# `--setup <setup arguments>`: after a successful install, run
+# `--setup <setup arguments>`: after the install (or, when an upgrade could
+# not complete, with the Raft Computer already installed), run
 # `raft-computer setup <setup arguments>` with the installed binary, so the
 # web's connect dialog can be one command
 # (`… | sh -s -- --setup /my-server [--machine <id>]`) and the user never
@@ -185,10 +186,21 @@ code=0
 if [ "$code" -eq 3 ]; then
   case "$cmd" in status|recover|help) ;; *) code=0; "$tmp/installer" "$cmd" "$@" || code=$? ;; esac
 fi
-if [ "$code" -eq 0 ] && [ -n "$setup_requested" ]; then
+if [ -n "$setup_requested" ]; then
   installed="${RAFT_COMPUTER_BINARY:-${RAFT_COMPUTER_INSTALL_DIR:-$HOME/.local/bin}/raft-computer}"
   # The installer resolves a relative path against the user's home; match it.
   case "$installed" in /*) ;; "~") installed=$HOME ;; "~/"*) installed="$HOME/${installed#"~/"}" ;; *) installed="$HOME/$installed" ;; esac
+  # An upgrade that was refused, rolled back or left for later still leaves
+  # a working Raft Computer: the installer has already said why. Connecting
+  # is what this command is for, so do it with the version that is there.
+  # Without a working one (a first install that failed) there is nothing to
+  # set up with, and the installer's exit stands.
+  if [ "$code" -ne 0 ] && "$installed" --version </dev/null >/dev/null 2>&1; then
+    printf '==> Connecting with the Raft Computer already on this machine\n'
+    code=0
+  fi
+fi
+if [ "$code" -eq 0 ] && [ -n "$setup_requested" ]; then
   # Codex's "==> Launching Codex": say what starts next.
   printf '==> Setting up Raft Computer\n'
   # Under `curl … | sh` stdin is this script; setup may need to ask the user.
