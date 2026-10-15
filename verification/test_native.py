@@ -8,6 +8,7 @@ import select
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 import unittest
 import urllib.parse
@@ -1396,8 +1397,13 @@ class InstallerContract(unittest.TestCase):
         machine = self.machine()
         machine.json(["install", "--version", "1.0.0"])
         machine.login_start()
-        result = machine.run(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True, extra=extra)
-        output = result.stdout + result.stderr
+        # The rollback restarts the 1.0.0 service, which would inherit captured
+        # pipes and keep the capture from ever returning; capture to a file.
+        with tempfile.TemporaryFile("w+") as log:
+            result = subprocess.run(machine.command(["--version", "1.2.0", "--setup", "/my-server"], bootstrap=True),
+                env=machine.env(extra), text=True, stdout=log, stderr=subprocess.STDOUT, timeout=180)
+            log.seek(0)
+            output = log.read()
         self.assertEqual(result.returncode, 0, output)
         self.assertIn("==> Connecting with the Raft Computer already on this machine", output)
         self.assertEqual(machine.live()["version"], "1.0.0")
