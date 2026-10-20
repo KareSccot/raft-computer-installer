@@ -601,11 +601,13 @@ mod native {
     pub fn environment(pid: u32) -> Result<Option<Vec<(OsString, OsString)>>> {
         match fs::read(format!("/proc/{pid}/environ")) {
             Ok(bytes) => Ok(Some(parse_environment(bytes.split(|b| *b == 0)))),
+            // A process exiting mid-read reports ESRCH; like an inaccessible
+            // one, its environment is simply unknown (counted as this home's).
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
+                ) || e.raw_os_error() == Some(libc::ESRCH) =>
             {
                 Ok(None)
             }
