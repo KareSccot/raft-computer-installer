@@ -239,7 +239,7 @@ pub async fn run() -> Result<u8> {
     // refuses before stopping anything (operation::upgrade).
     if ["upgrade", "repair"].contains(&args.request.command.as_str())
         && env::var_os(crate::systemd::ESCAPED_ENV).is_none()
-        && let Some(unit) = crate::systemd::product_unit(&cfg)?
+        && let Some(unit) = crate::systemd::product_unit(&cfg).await?
         && crate::systemd::self_inside(&unit)
     {
         match crate::systemd::escape(&unit, &raw_args).await {

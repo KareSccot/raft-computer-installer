@@ -418,8 +418,9 @@ fn service_unit(plan: &Plan) -> Option<crate::systemd::ServiceUnit> {
         .and_then(|unit| serde_json::from_str(unit).ok())
 }
 
-fn systemd_confinement(cfg: &Config) -> Result<Option<String>> {
-    Ok(crate::systemd::product_unit(cfg)?
+async fn systemd_confinement(cfg: &Config) -> Result<Option<String>> {
+    Ok(crate::systemd::product_unit(cfg)
+        .await?
         .filter(crate::systemd::self_inside)
         .map(|unit| crate::systemd::confinement_reason(&unit)))
 }
@@ -452,7 +453,7 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         transition(cfg, plan, Phase::Ready)?;
     }
     if plan.phase == Phase::Ready {
-        if let Some(reason) = systemd_confinement(cfg)? {
+        if let Some(reason) = systemd_confinement(cfg).await? {
             return refuse_confined(cfg, plan, reason);
         }
         let _lock = UpgradeLock::acquire(&cfg.k_state)?;
@@ -692,10 +693,10 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
             .running
             .or(Some(prior.map_or(answer.running, |state| state.running)));
         if plan.kind == Kind::Repair {
-            if let Some(reason) = systemd_confinement(cfg)? {
+            if let Some(reason) = systemd_confinement(cfg).await? {
                 return refuse_confined(cfg, plan, reason);
             }
-            if let Some(unit) = crate::systemd::product_unit(cfg)? {
+            if let Some(unit) = crate::systemd::product_unit(cfg).await? {
                 plan.detail
                     .insert("serviceUnit".into(), serde_json::to_string(&unit)?);
             }

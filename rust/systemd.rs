@@ -82,14 +82,45 @@ fn cgroup_of(_pid: u32) -> Option<String> {
     None
 }
 
-/// The unit running the installed product's service, if any.
-pub fn product_unit(cfg: &Config) -> Result<Option<ServiceUnit>> {
-    for process in crate::host::installed_product_processes(cfg)? {
-        if let Some(unit) = cgroup_of(process.pid).as_deref().and_then(unit_of_cgroup) {
+/// The unit running the installed product's service, if any: a unit whose
+/// main process is the product itself. A product started from inside some
+/// other service (a CI runner, a desktop launcher's app unit) is not that
+/// unit's to stop or start.
+pub async fn product_unit(cfg: &Config) -> Result<Option<ServiceUnit>> {
+    let processes = crate::host::installed_product_processes(cfg)?;
+    for process in &processes {
+        let Some(unit) = cgroup_of(process.pid).as_deref().and_then(unit_of_cgroup) else {
+            continue;
+        };
+        if main_pid(&unit)
+            .await
+            .is_some_and(|main| processes.iter().any(|product| product.pid == main))
+        {
             return Ok(Some(unit));
         }
     }
     Ok(None)
+}
+
+/// `systemctl [--user] show -p MainPID --value -- <unit>`; None when unknown.
+async fn main_pid(unit: &ServiceUnit) -> Option<u32> {
+    let mut command = command("systemctl", unit);
+    command
+        .args(["show", "-p", "MainPID", "--value", "--", unit.name.as_str()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
 }
 
 /// Whether this process would be stopped together with the unit.

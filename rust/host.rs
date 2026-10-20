@@ -196,6 +196,7 @@ pub async fn prepare(
     // Both sides of a rollback must have locally available, verified sidecars.
     artifact::saved_sidecar(cfg, &operation.from_version)?;
     let answer = answer(cfg).await?;
+    let service_unit = crate::systemd::product_unit(cfg).await?;
     save(
         cfg,
         &ProductState {
@@ -210,7 +211,7 @@ pub async fn prepare(
             forced_stops: vec![],
             last_start: None,
             waiting_caller: cfg.waiting_caller.clone(),
-            service_unit: crate::systemd::product_unit(cfg)?,
+            service_unit,
         },
     )
 }
