@@ -109,6 +109,12 @@ commands. A live status attestation supplies `servicePid`, `computerVersion` and
 `serviceGeneration`; the installer also checks OS process identity. Stopped
 installations are checked through a short-lived `--version` process.
 
+Several state homes (`RAFT_HOME`) may run one installed binary. An operation
+acts only on its own home's Computer: a process on the shared binary whose
+environment resolves to another home is left running (on its old image until
+that home restarts it). Where the environment cannot be read (Windows, access
+denied) the process counts as this home's, as before.
+
 Computer raw/gzip and `photon_rs_bg.wasm` identities come from one Hands
 `updates/check` selection. Exact versions and channels both freeze immutable
 Hands release URLs; there is no product CDN manifest fallback. Missing WASM,

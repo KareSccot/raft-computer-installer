@@ -117,6 +117,24 @@ pub fn product_executables(cfg: &Config) -> [PathBuf; 3] {
     ]
 }
 
+/// Several state homes (`RAFT_HOME`) can run one installed binary, but each
+/// has its own K state and service. A process on the shared binary whose
+/// environment names another home is that home's Computer, not this
+/// installation's: stopping it for this upgrade would leave it down, and it
+/// keeps running its old image after publication. Slot artifacts live under
+/// this home's K state, and a process whose home cannot be read counts as
+/// this one.
+fn of_this_state_home(cfg: &Config, identity: &process::Identity) -> Result<bool> {
+    if !process::same_path(&identity.executable, &cfg.binary) {
+        return Ok(true);
+    }
+    let Some(environment) = process::environment(identity)? else {
+        return Ok(true);
+    };
+    Ok(crate::config::state_home_of(&environment)
+        .is_none_or(|home| process::same_path(&home, &cfg.state_home)))
+}
+
 pub fn installed_product_processes(cfg: &Config) -> Result<Vec<process::Identity>> {
     let caller = cfg.waiting_caller.as_ref();
     let mut processes = Vec::new();
@@ -124,6 +142,7 @@ pub fn installed_product_processes(cfg: &Config) -> Result<Vec<process::Identity
         for identity in process::installed(&executable)? {
             if !caller.is_some_and(|c| process::same_instance(c, &identity))
                 && !processes.contains(&identity)
+                && of_this_state_home(cfg, &identity)?
             {
                 processes.push(identity);
             }
@@ -818,6 +837,85 @@ mod legacy_layout_tests {
                 .any(|p| p.pid == pid),
             "a live slot process must count as a running product before quarantine",
         );
+    }
+
+    fn spawn_binary_copy(cfg: &Config, home: Option<&std::path::Path>) -> Killed {
+        if !cfg.binary.exists() {
+            fs::create_dir_all(&cfg.install_dir).unwrap();
+            fs::copy("/bin/sleep", &cfg.binary).unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        Killed(loop {
+            let mut command = Command::new(&cfg.binary);
+            command
+                .arg("30")
+                .env_remove("RAFT_HOME")
+                .env_remove("SLOCK_HOME");
+            command.env("HOME", &cfg.user_home);
+            if let Some(home) = home {
+                command.env("RAFT_HOME", home);
+            }
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("binary fixture did not start: {error}"),
+            }
+        })
+    }
+
+    fn found(cfg: &Config, pid: u32) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if installed_product_processes(cfg)
+                .unwrap()
+                .iter()
+                .any(|p| p.pid == pid)
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Two Computers on one machine share ~/.local/bin/raft-computer with
+    // different RAFT_HOMEs; upgrading one stopped the other (2026-10-19).
+    #[test]
+    fn a_computer_of_another_state_home_on_the_shared_binary_is_not_this_installation() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        let other = spawn_binary_copy(&cfg, Some(&root.path().join("other-home")));
+        let this = spawn_binary_copy(&cfg, Some(&cfg.state_home));
+        assert!(
+            found(&cfg, this.0.id()),
+            "this home's Computer is this installation's product"
+        );
+        assert!(
+            !installed_product_processes(&cfg)
+                .unwrap()
+                .iter()
+                .any(|p| p.pid == other.0.id()),
+            "another home's Computer must not be stopped or block this upgrade",
+        );
+    }
+
+    #[test]
+    fn a_computer_without_raft_home_resolves_the_default_home() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path());
+        // No RAFT_HOME: the process resolves ~/.raft under its HOME.
+        cfg.state_home = root.path().join(".raft");
+        let default = spawn_binary_copy(&cfg, None);
+        assert!(found(&cfg, default.0.id()));
+        cfg.state_home = root.path().join("state");
+        assert!(!found(&cfg, default.0.id()));
     }
 
     #[test]
