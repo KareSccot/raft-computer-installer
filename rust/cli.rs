@@ -241,15 +241,33 @@ pub async fn run() -> Result<u8> {
         && env::var_os(crate::systemd::ESCAPED_ENV).is_none()
         && let Some(unit) = crate::systemd::product_unit(&cfg)?
         && crate::systemd::self_inside(&unit)
-        && crate::systemd::escape(&unit, &raw_args).await
     {
-        if !args.json {
-            println!(
-                "Continuing the {} outside systemd unit {}.",
-                args.request.command, unit.name
-            );
+        match crate::systemd::escape(&unit, &raw_args).await {
+            crate::systemd::Escape::Running | crate::systemd::Escape::Exited(Some(0)) => {
+                if !args.json {
+                    println!(
+                        "Continuing the {} outside systemd unit {}.",
+                        args.request.command, unit.name
+                    );
+                }
+                return Ok(0);
+            }
+            // The copy got as far as settling this request: its receipt is
+            // the answer, never a second, contradicting one from here.
+            crate::systemd::Escape::Exited(_) => {
+                if let Some(receipt) = crate::report::read(&cfg, &args.request.id)? {
+                    let reply = Reply::receipt(receipt);
+                    if args.json {
+                        println!("{}", serde_json::to_string(&reply)?);
+                    } else {
+                        println!("{}", reply.line);
+                    }
+                    return Ok(reply.exit_code);
+                }
+            }
+            crate::systemd::Escape::Failed => {}
         }
-        return Ok(0);
+        // Could not leave the unit: the operation refuses before stopping.
     }
     let reply = supervisor::run(&cfg, &args.request).await?;
     if args.json {

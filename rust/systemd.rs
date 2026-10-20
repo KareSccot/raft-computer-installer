@@ -124,7 +124,7 @@ fn command(program: &str, unit: &ServiceUnit) -> tokio::process::Command {
 pub async fn systemctl(unit: &ServiceUnit, action: &str) -> Result<()> {
     let mut command = command("systemctl", unit);
     command
-        .args([action, unit.name.as_str()])
+        .args([action, "--", unit.name.as_str()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
@@ -144,11 +144,19 @@ pub async fn systemctl(unit: &ServiceUnit, action: &str) -> Result<()> {
     Ok(())
 }
 
-/// Re-run this invocation in a transient scope outside the unit. Returns true
-/// once the copy is running there; it carries the operation from here.
-pub async fn escape(unit: &ServiceUnit, args: &[String]) -> bool {
+pub enum Escape {
+    /// The copy is running in its own scope and carries the operation.
+    Running,
+    /// `systemd-run` (or the copy) exited within the first seconds.
+    Exited(Option<i32>),
+    /// Nothing could be started.
+    Failed,
+}
+
+/// Re-run this invocation in a transient scope outside the unit.
+pub async fn escape(unit: &ServiceUnit, args: &[String]) -> Escape {
     let Ok(executable) = std::env::current_exe() else {
-        return false;
+        return Escape::Failed;
     };
     let mut command = command("systemd-run", unit);
     command
@@ -159,14 +167,15 @@ pub async fn escape(unit: &ServiceUnit, args: &[String]) -> bool {
         .env(ESCAPED_ENV, "1")
         .stdin(std::process::Stdio::null());
     let Ok(mut child) = command.spawn() else {
-        return false;
+        return Escape::Failed;
     };
     // systemd-run fails fast when it cannot create the scope (no manager,
-    // not permitted); a running copy is in its scope.
+    // not permitted); a copy still running after that is in its scope. A
+    // copy that already finished may have written this request's receipt.
     match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(status)) => status.success(),
-        Ok(Err(_)) => false,
-        Err(_) => true,
+        Ok(Ok(status)) => Escape::Exited(status.code()),
+        Ok(Err(_)) => Escape::Failed,
+        Err(_) => Escape::Running,
     }
 }
 
@@ -178,7 +187,7 @@ pub fn confinement_reason(unit: &ServiceUnit) -> String {
         "systemctl"
     };
     format!(
-        "The Computer service runs in systemd unit {name}, which would stop the installer together with the service, and the installer could not move out of it. Upgrade from the host: `{manager} stop {name}`, run the install command, then `{manager} start {name}`.",
+        "The Computer service runs in systemd unit {name}, which would stop the upgrade together with the service, and the upgrade could not move out of it. Upgrade from the host: `{manager} stop {name}`, run the install command, then `{manager} start {name}`.",
         name = unit.name
     )
 }
