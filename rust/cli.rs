@@ -194,6 +194,7 @@ pub async fn run() -> Result<u8> {
             _ => {}
         }
     }
+    let raw_args = args.clone();
     let mut args = parse(&args)?;
     if ["install", "upgrade", "repair"].contains(&args.request.command.as_str()) {
         let marker = env::var("RAFT_COMPUTER_INSTALLER_CALLER").ok();
@@ -231,6 +232,24 @@ pub async fn run() -> Result<u8> {
                 return Ok(reply.exit_code);
             }
         }
+    }
+    // Started inside the systemd unit that runs the service (Computer up to
+    // 1.0.47 launches it there): continue from a scope of its own, so stopping
+    // the unit does not stop this upgrade. If that fails, the operation
+    // refuses before stopping anything (operation::upgrade).
+    if ["upgrade", "repair"].contains(&args.request.command.as_str())
+        && env::var_os(crate::systemd::ESCAPED_ENV).is_none()
+        && let Some(unit) = crate::systemd::product_unit(&cfg)?
+        && crate::systemd::self_inside(&unit)
+        && crate::systemd::escape(&unit, &raw_args).await
+    {
+        if !args.json {
+            println!(
+                "Continuing the {} outside systemd unit {}.",
+                args.request.command, unit.name
+            );
+        }
+        return Ok(0);
     }
     let reply = supervisor::run(&cfg, &args.request).await?;
     if args.json {

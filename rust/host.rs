@@ -30,6 +30,10 @@ pub struct ProductState {
     pub last_start: Option<Start>,
     #[serde(default)]
     pub waiting_caller: Option<process::Identity>,
+    /// The systemd unit running the service when the operation began; the
+    /// product is then stopped and started through `systemctl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_unit: Option<crate::systemd::ServiceUnit>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -206,6 +210,7 @@ pub async fn prepare(
             forced_stops: vec![],
             last_start: None,
             waiting_caller: cfg.waiting_caller.clone(),
+            service_unit: crate::systemd::product_unit(cfg)?,
         },
     )
 }
@@ -244,10 +249,19 @@ pub async fn live_evidence(cfg: &Config) -> Result<Evidence> {
     Ok(evidence)
 }
 
-pub async fn stop_product(cfg: &Config) -> Result<Vec<u32>> {
-    // The product gets the first opportunity to unregister or stop its service.
+pub async fn stop_product(
+    cfg: &Config,
+    unit: Option<&crate::systemd::ServiceUnit>,
+) -> Result<Vec<u32>> {
+    // The product gets the first opportunity to unregister or stop its service;
+    // a systemd unit is stopped by its manager, which then does not restart it.
     // The bounded fallback acts only on OS-identified instances of this binary.
-    let _ = computer::lifecycle(cfg, "stop").await?;
+    match unit {
+        Some(unit) => crate::systemd::systemctl(unit, "stop").await?,
+        None => {
+            let _ = computer::lifecycle(cfg, "stop").await?;
+        }
+    }
     let processes = installed_product_processes(cfg)?;
     let remaining = process::wait_gone(&processes, Duration::from_secs(3)).await?;
     let forced = process::terminate(&remaining).await?;
@@ -340,7 +354,25 @@ pub fn publish(cfg: &Config, slot: Slot) -> Result<String> {
     Ok(version)
 }
 
-async fn start_product_attempt(cfg: &Config) -> std::result::Result<Evidence, ProductStartError> {
+async fn start_product_attempt(
+    cfg: &Config,
+    unit: Option<&crate::systemd::ServiceUnit>,
+) -> std::result::Result<Evidence, ProductStartError> {
+    if let Some(unit) = unit {
+        crate::systemd::systemctl(unit, "start")
+            .await
+            .map_err(|error| ProductStartError {
+                failure: computer::LifecycleFailure {
+                    kind: "command-error".into(),
+                    argv: vec!["start".into()],
+                    exit_code: None,
+                    stderr_tail: error.to_string(),
+                    stderr_truncated: false,
+                },
+                error,
+            })?;
+        return wait_ready(cfg, vec!["start".into()]).await;
+    }
     let lifecycle = computer::lifecycle(cfg, "start")
         .await
         .map_err(|error| ProductStartError {
@@ -365,6 +397,13 @@ async fn start_product_attempt(cfg: &Config) -> std::result::Result<Evidence, Pr
             }),
         });
     }
+    wait_ready(cfg, vec!["start".into()]).await
+}
+
+async fn wait_ready(
+    cfg: &Config,
+    argv: Vec<String>,
+) -> std::result::Result<Evidence, ProductStartError> {
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         match live_evidence(cfg).await {
@@ -374,7 +413,7 @@ async fn start_product_attempt(cfg: &Config) -> std::result::Result<Evidence, Pr
                     error,
                     failure: computer::LifecycleFailure {
                         kind: "readiness-uncertain".into(),
-                        argv: vec!["start".into()],
+                        argv: argv.clone(),
                         exit_code: Some(0),
                         stderr_tail: String::new(),
                         stderr_truncated: false,
@@ -388,7 +427,7 @@ async fn start_product_attempt(cfg: &Config) -> std::result::Result<Evidence, Pr
                 error: invalid("product did not become ready"),
                 failure: computer::LifecycleFailure {
                     kind: "readiness-timeout".into(),
-                    argv: vec!["start".into()],
+                    argv,
                     exit_code: Some(0),
                     stderr_tail: String::new(),
                     stderr_truncated: false,
@@ -399,8 +438,11 @@ async fn start_product_attempt(cfg: &Config) -> std::result::Result<Evidence, Pr
     }
 }
 
-pub async fn start_product(cfg: &Config) -> Result<Evidence> {
-    start_product_attempt(cfg)
+pub async fn start_product(
+    cfg: &Config,
+    unit: Option<&crate::systemd::ServiceUnit>,
+) -> Result<Evidence> {
+    start_product_attempt(cfg, unit)
         .await
         .map_err(|failure| failure.error)
 }
@@ -537,7 +579,7 @@ async fn start(cfg: &Config, slot: Slot) -> Result<()> {
         }
         publish(cfg, slot)?;
         let evidence = if record.running {
-            match start_product_attempt(cfg).await {
+            match start_product_attempt(cfg, record.service_unit.as_ref()).await {
                 Ok(evidence) => evidence,
                 Err(failure) => {
                     if let Ok(reference) =
@@ -643,7 +685,9 @@ async fn dispatch(cfg: &Config, request: Request) -> Result<Value> {
         "stop" => {
             let mut record = read(cfg)?;
             if record.running {
-                record.forced_stops.extend(stop_product(cfg).await?);
+                record
+                    .forced_stops
+                    .extend(stop_product(cfg, record.service_unit.as_ref()).await?);
                 save(cfg, &record)?;
             } else if !installed_product_processes(cfg)?.is_empty() {
                 return Err(Error::Uncertain(
