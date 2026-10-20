@@ -82,19 +82,60 @@ fn cgroup_of(_pid: u32) -> Option<String> {
     None
 }
 
+/// The parent pid from `/proc/<pid>/stat` (the field after the command name,
+/// which may itself contain spaces and parentheses).
+pub fn parent_from_stat(stat: &str) -> Option<u32> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Shell interpreters a unit's `ExecStart=` script runs under.
+pub fn is_shell_name(name: &str) -> bool {
+    ["sh", "bash", "dash", "zsh", "ash", "ksh", "mksh", "busybox"].contains(&name)
+}
+
+#[cfg(target_os = "linux")]
+fn parent_of(pid: u32) -> Option<u32> {
+    parent_from_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+#[cfg(target_os = "linux")]
+fn is_shell(pid: u32) -> bool {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .is_some_and(|name| is_shell_name(&name))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn parent_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_shell(_pid: u32) -> bool {
+    false
+}
+
 /// The unit running the installed product's service, if any: a unit whose
-/// main process is the product itself. A product started from inside some
-/// other service (a CI runner, a desktop launcher's app unit) is not that
-/// unit's to stop or start.
+/// main process is the product itself, or a shell script that started the
+/// product as its direct child (`ExecStart=` a wrapper without `exec`). A
+/// product started from inside some other service (a CI runner, a desktop
+/// app's unit) is not that unit's to stop or start.
 pub async fn product_unit(cfg: &Config) -> Result<Option<ServiceUnit>> {
     let processes = crate::host::installed_product_processes(cfg)?;
     for process in &processes {
         let Some(unit) = cgroup_of(process.pid).as_deref().and_then(unit_of_cgroup) else {
             continue;
         };
-        if main_pid(&unit)
-            .await
-            .is_some_and(|main| processes.iter().any(|product| product.pid == main))
+        let Some(main) = main_pid(&unit).await else {
+            continue;
+        };
+        if processes.iter().any(|product| product.pid == main)
+            || (parent_of(process.pid) == Some(main) && is_shell(main))
         {
             return Ok(Some(unit));
         }
@@ -284,6 +325,26 @@ mod tests {
             Some("/system.slice/a.service")
         );
         assert_eq!(cgroup_path(""), None);
+    }
+
+    #[test]
+    fn a_wrapper_shell_is_recognized_by_its_parent_pid_and_name() {
+        assert_eq!(
+            parent_from_stat("4242 (raft-computer) S 4100 4242 4242 0 -1"),
+            Some(4100)
+        );
+        assert_eq!(
+            parent_from_stat("4242 (a b) c)) S 77 1 1"),
+            Some(77),
+            "a command name with spaces and parentheses"
+        );
+        assert_eq!(parent_from_stat("garbage"), None);
+        assert!(is_shell_name("bash") && is_shell_name("sh") && is_shell_name("dash"));
+        assert!(
+            !is_shell_name("node")
+                && !is_shell_name("Runner.Listener")
+                && !is_shell_name("raft-desktop")
+        );
     }
 
     #[test]
