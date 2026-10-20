@@ -4,6 +4,7 @@ use crate::{Error, Result};
 use k_carrier::error::invalid;
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -22,7 +23,7 @@ pub fn same_instance(left: &Identity, right: &Identity) -> bool {
     left.pid == right.pid && left.created == right.created
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
+pub(crate) fn same_path(left: &Path, right: &Path) -> bool {
     let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
     #[cfg(windows)]
@@ -76,6 +77,38 @@ pub fn observe(pid: u32) -> Result<Option<Identity>> {
         return Ok(None);
     }
     native::observe(pid)
+}
+
+/// The environment of a same-user process, used to tell apart Computer
+/// instances that run one shared installed binary with different state homes
+/// (`RAFT_HOME`). `None` when the OS does not expose it (Windows, access
+/// denied) or the instance is no longer the one observed.
+pub fn environment(identity: &Identity) -> Result<Option<Vec<(OsString, OsString)>>> {
+    let Some(environment) = native::environment(identity.pid)? else {
+        return Ok(None);
+    };
+    // The PID may have been reused while reading; only the observed instance counts.
+    if observe(identity.pid)?.as_ref() != Some(identity) {
+        return Ok(None);
+    }
+    Ok(Some(environment))
+}
+
+/// `NAME=value` entries separated by NUL, as in `/proc/<pid>/environ`; stops
+/// at the first empty entry.
+#[cfg(unix)]
+fn parse_environment<'a>(entries: impl Iterator<Item = &'a [u8]>) -> Vec<(OsString, OsString)> {
+    use std::os::unix::ffi::OsStrExt;
+    entries
+        .take_while(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let split = entry.iter().position(|b| *b == b'=')?;
+            Some((
+                std::ffi::OsStr::from_bytes(&entry[..split]).to_owned(),
+                std::ffi::OsStr::from_bytes(&entry[split + 1..]).to_owned(),
+            ))
+        })
+        .collect()
 }
 
 const PROCESS_EXIT_SETTLE_ATTEMPTS: usize = 10;
@@ -565,6 +598,21 @@ mod native {
         }))
     }
 
+    pub fn environment(pid: u32) -> Result<Option<Vec<(OsString, OsString)>>> {
+        match fs::read(format!("/proc/{pid}/environ")) {
+            Ok(bytes) => Ok(Some(parse_environment(bytes.split(|b| *b == 0)))),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn pids() -> Result<Vec<u32>> {
         let mut pids = Vec::new();
         for entry in fs::read_dir("/proc")? {
@@ -713,6 +761,66 @@ mod native {
         }))
     }
 
+    pub fn environment(pid: u32) -> Result<Option<Vec<(OsString, OsString)>>> {
+        if pid > i32::MAX as u32 {
+            return Ok(None);
+        }
+        let mut argmax: libc::c_int = 0;
+        let mut size = size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut argmax as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+            || argmax <= 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // KERN_PROCARGS2: argc, the exec path, NUL padding, argv, then the
+        // environment, each NUL-terminated.
+        let mut buffer = vec![0u8; argmax as usize];
+        let mut size = buffer.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::ESRCH | libc::EPERM)
+            ) {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        buffer.truncate(size);
+        let Some((count, rest)) = buffer.split_first_chunk::<4>() else {
+            return Ok(None);
+        };
+        let argc = i32::from_ne_bytes(*count).max(0) as usize;
+        let mut entries = rest.split(|b| *b == 0);
+        // The exec path, then the padding NULs before argv[0].
+        if entries.next().is_none() {
+            return Ok(None);
+        }
+        let mut entries = entries.skip_while(|entry| entry.is_empty()).skip(argc);
+        Ok(Some(parse_environment(&mut entries)))
+    }
+
     pub fn pids() -> Result<Vec<u32>> {
         // libproc's PROC_ALL_PIDS enumerates identities, not command-line text.
         let needed = unsafe { libc::proc_listpids(1, 0, std::ptr::null_mut(), 0) };
@@ -787,6 +895,11 @@ mod native {
 
     pub fn definitely_exited(pid: u32) -> Result<bool> {
         Ok(!k_carrier::lock::process_alive(pid))
+    }
+
+    /// Another process's environment is not exposed by a supported Windows API.
+    pub fn environment(_pid: u32) -> Result<Option<Vec<(OsString, OsString)>>> {
+        Ok(None)
     }
 
     fn identity(handle: HANDLE, pid: u32) -> Result<Option<Identity>> {
@@ -1140,5 +1253,66 @@ mod caller_tests {
             }
         ));
         assert!(!same_instance(&original, &Identity { pid: 43, ..renamed }));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod environment_tests {
+    use super::*;
+    use std::process::{Child, Command};
+
+    struct OwnedChild(Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // A Computer's state home is read from its environment, including on
+    // macOS (KERN_PROCARGS2), where argv precedes the environment.
+    #[test]
+    fn reads_a_child_environment_after_its_arguments() {
+        let child = OwnedChild(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .env_clear()
+                .env("RAFT_HOME", "/fixture/home with space")
+                .env("HOME", "/fixture/user")
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let environment = loop {
+            let identity = observe(child.0.id()).unwrap();
+            let read = match identity {
+                Some(identity) => environment(&identity).unwrap(),
+                None => None,
+            };
+            match read {
+                Some(environment) if environment.iter().any(|(k, _)| k == "RAFT_HOME") => {
+                    break environment;
+                }
+                _ if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => panic!("child environment was not read: {other:?}"),
+            }
+        };
+        assert!(environment.contains(&("RAFT_HOME".into(), "/fixture/home with space".into())));
+        assert!(environment.contains(&("HOME".into(), "/fixture/user".into())));
+        assert!(
+            !environment.iter().any(|(k, _)| k == "30"),
+            "argv is not environment"
+        );
+    }
+
+    #[test]
+    fn parses_entries_until_the_first_empty_one() {
+        let bytes = b"A=1\0B=x=y\0NOEQUALS\0\0C=after\0";
+        assert_eq!(
+            parse_environment(bytes.split(|b| *b == 0)),
+            vec![("A".into(), "1".into()), ("B".into(), "x=y".into())],
+        );
     }
 }

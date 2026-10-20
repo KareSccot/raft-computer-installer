@@ -84,6 +84,43 @@ fn default_state_home(user_home: &Path) -> PathBuf {
     }
 }
 
+/// `RAFT_HOME`, then `SLOCK_HOME`, then the default under `user_home`, before
+/// `~` expansion and absolutization.
+fn state_home_setting(var: impl Fn(&str) -> Option<OsString>, user_home: &Path) -> PathBuf {
+    var("RAFT_HOME")
+        .or_else(|| var("SLOCK_HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_state_home(user_home))
+}
+
+/// The state home another process resolved from its own environment, the way
+/// [`Config::load`] does. `None` when that cannot be told from the environment
+/// alone (no usable `HOME`, or a path relative to the process's working
+/// directory).
+pub fn state_home_of(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
+    let var = |key: &str| {
+        environment
+            .iter()
+            .rev()
+            .find(|(name, _)| name.as_os_str() == key)
+            .map(|(_, value)| value.clone())
+    };
+    let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let user_home = var(home_key).filter(|p| !p.is_empty()).map(PathBuf::from)?;
+    if !user_home.is_absolute() {
+        return None;
+    }
+    let setting = state_home_setting(var, &user_home);
+    let expanded = if setting == Path::new("~") {
+        user_home
+    } else if let Ok(tail) = setting.strip_prefix("~") {
+        user_home.join(tail)
+    } else {
+        setting
+    };
+    expanded.is_absolute().then_some(expanded)
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
@@ -95,10 +132,7 @@ impl Config {
             return Err(invalid("user home must be absolute"));
         }
         let state_home = absolute(
-            &env::var_os("RAFT_HOME")
-                .or_else(|| env::var_os("SLOCK_HOME"))
-                .map(PathBuf::from)
-                .unwrap_or_else(|| default_state_home(&user_home)),
+            &state_home_setting(|key| env::var_os(key), &user_home),
             &user_home,
         )?;
         let install_dir = absolute(
@@ -210,5 +244,49 @@ mod default_state_home_tests {
         fs::create_dir_all(home.path().join(".slock")).unwrap();
         fs::write(home.path().join(".slock/.cli-rename-notice"), "").unwrap();
         assert_eq!(default_state_home(home.path()), home.path().join(".raft"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod state_home_of_tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
+    }
+
+    #[test]
+    fn resolves_like_config_load() {
+        let user = tempfile::tempdir().unwrap();
+        let home = user.path().to_str().unwrap();
+        assert_eq!(
+            state_home_of(&env(&[("HOME", home), ("RAFT_HOME", "/srv/rw")])),
+            Some(PathBuf::from("/srv/rw"))
+        );
+        assert_eq!(
+            state_home_of(&env(&[("HOME", home), ("SLOCK_HOME", "~/rw")])),
+            Some(user.path().join("rw"))
+        );
+        assert_eq!(
+            state_home_of(&env(&[("HOME", home)])),
+            Some(user.path().join(".raft"))
+        );
+        std::fs::create_dir_all(user.path().join(".slock/computer")).unwrap();
+        assert_eq!(
+            state_home_of(&env(&[("HOME", home)])),
+            Some(user.path().join(".slock"))
+        );
+    }
+
+    #[test]
+    fn unknown_without_home_or_with_a_relative_path() {
+        assert_eq!(state_home_of(&env(&[("RAFT_HOME", "/srv/rw")])), None);
+        assert_eq!(
+            state_home_of(&env(&[("HOME", "/u"), ("RAFT_HOME", "rw")])),
+            None
+        );
     }
 }
