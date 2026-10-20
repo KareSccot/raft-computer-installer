@@ -409,6 +409,32 @@ fn rollback_copy(
     (format!("{reason} Run `raft-computer start`."), reason)
 }
 
+/// Refuse before stopping anything when the systemd unit that runs the
+/// service would also stop this installer (it could not leave; cli.rs).
+/// The unit recorded when a repair began (see `serviceUnit`).
+fn service_unit(plan: &Plan) -> Option<crate::systemd::ServiceUnit> {
+    plan.detail
+        .get("serviceUnit")
+        .and_then(|unit| serde_json::from_str(unit).ok())
+}
+
+async fn systemd_confinement(cfg: &Config) -> Result<Option<String>> {
+    Ok(crate::systemd::product_unit(cfg)
+        .await?
+        .filter(crate::systemd::self_inside)
+        .map(|unit| crate::systemd::confinement_reason(&unit)))
+}
+
+fn refuse_confined(cfg: &Config, plan: &mut Plan, reason: String) -> Result<Reply> {
+    finish(
+        cfg,
+        plan,
+        Outcome::Held,
+        Some((FailureCode::InstallationHeld, reason.clone())),
+        &reason,
+    )
+}
+
 async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply> {
     if plan.phase == Phase::Preparing {
         if recovery {
@@ -427,6 +453,9 @@ async fn upgrade(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         transition(cfg, plan, Phase::Ready)?;
     }
     if plan.phase == Phase::Ready {
+        if let Some(reason) = systemd_confinement(cfg).await? {
+            return refuse_confined(cfg, plan, reason);
+        }
         let _lock = UpgradeLock::acquire(&cfg.k_state)?;
         let from = plan
             .from_version
@@ -663,6 +692,15 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         plan.running = plan
             .running
             .or(Some(prior.map_or(answer.running, |state| state.running)));
+        if plan.kind == Kind::Repair {
+            if let Some(reason) = systemd_confinement(cfg).await? {
+                return refuse_confined(cfg, plan, reason);
+            }
+            if let Some(unit) = crate::systemd::product_unit(cfg).await? {
+                plan.detail
+                    .insert("serviceUnit".into(), serde_json::to_string(&unit)?);
+            }
+        }
         transition(
             cfg,
             plan,
@@ -687,7 +725,7 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
                 crate::process::terminate(&crate::host::installed_product_processes(cfg)?).await?,
             );
         }
-        forced.extend(host::stop_product(cfg).await?);
+        forced.extend(host::stop_product(cfg, service_unit(plan).as_ref()).await?);
         if let Some(path) = computer::preserve_commands_after_stop(cfg, &plan.request.id).await? {
             plan.detail.insert(
                 "commandQuarantine".into(),
@@ -775,7 +813,7 @@ async fn install(cfg: &Config, plan: &mut Plan, recovery: bool) -> Result<Reply>
         if plan.running == Some(true) || plan.setup_succeeded {
             let evidence = match host::live_evidence(cfg).await {
                 Ok(evidence) => evidence,
-                Err(_) => host::start_product(cfg).await?,
+                Err(_) => host::start_product(cfg, service_unit(plan).as_ref()).await?,
             };
             if evidence.version != plan.manifest.version {
                 return Err(Error::Uncertain(

@@ -16,6 +16,7 @@ pub mod runner;
 pub mod shell_path;
 pub mod source;
 pub mod supervisor;
+pub mod systemd;
 pub mod version;
 pub mod world;
 
