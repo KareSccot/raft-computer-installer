@@ -1,0 +1,40 @@
+name: Mirror R2 artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      main_url:
+        description: 'presigned URL for main binary'
+        required: true
+      wasm_url:
+        description: 'presigned URL for photon wasm'
+        required: true
+      main_sha:
+        description: 'expected sha256 of main binary'
+        required: true
+      wasm_sha:
+        description: 'expected sha256 of wasm'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts from R2
+        run: |
+          set -eu
+          curl -fsSL --retry 3 -o raft-computer-darwin-arm64 "${{ inputs.main_url }}"
+          curl -fsSL --retry 3 -o photon_rs_bg.wasm "${{ inputs.wasm_url }}"
+          echo "${{ inputs.main_sha }}  raft-computer-darwin-arm64" | sha256sum -c -
+          echo "${{ inputs.wasm_sha }}  photon_rs_bg.wasm" | sha256sum -c -
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: r2-mirror
+          path: |
+            raft-computer-darwin-arm64
+            photon_rs_bg.wasm
+          retention-days: 1
