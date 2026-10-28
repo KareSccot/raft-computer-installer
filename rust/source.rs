@@ -178,7 +178,7 @@ pub(crate) const SYSTEM_ROOTS_UNUSABLE: &str =
 /// HTTPS installs its root there. Verification stays on, and release content
 /// is still checked by sha256. Turning them off leaves the bundled roots.
 pub(crate) fn trusting(builder: reqwest::ClientBuilder, native: bool) -> reqwest::ClientBuilder {
-    builder.tls_built_in_native_certs(native)
+    crate::proxy::configure(builder).tls_built_in_native_certs(native)
 }
 
 /// Build with the system's roots first. A system store whose certificates
@@ -266,10 +266,7 @@ impl Source {
         }
         let hands_origin = base_url(&cfg.hands_origin)?;
         let hands_host = hands_origin.host_str().map(str::to_owned);
-        // Proxies come from HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY and, for
-        // each of those left unset, from the Windows Internet Settings or
-        // macOS system proxy (Cargo feature system-proxy), as browsers and
-        // the PowerShell bootstrap already do.
+        // Proxies as in crate::proxy (environment, then the system proxy).
         // A redirect off the Hands host is never followed: release
         // selection only comes from Hands, and a network filter that
         // answers for Hands is reported by its exact redirect instead.
