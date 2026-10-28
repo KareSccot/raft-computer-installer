@@ -169,9 +169,26 @@ fn network_redirect(origin: &Url, requested: &Url, status: u16, target: &Url) ->
     ))
 }
 
+pub(crate) const CERTIFICATE_REJECTED: &str = "its HTTPS certificate is not trusted on this computer; a company proxy may be re-signing HTTPS";
+
+/// TLS rejected the server's certificate. rustls is not a direct dependency,
+/// so its error is recognised by message anywhere in the cause chain.
+pub(crate) fn certificate_rejected(error: &reqwest::Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if current.to_string().contains("invalid peer certificate") {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
 fn unreachable(url: &Url, error: &reqwest::Error) -> crate::Error {
     let cause = if error.is_timeout() {
         "the request timed out"
+    } else if certificate_rejected(error) {
+        CERTIFICATE_REJECTED
     } else if error.is_connect() {
         "the connection failed"
     } else if error.is_redirect() {
@@ -196,6 +213,10 @@ impl Source {
         let hands_host = hands_origin.host_str().map(str::to_owned);
         Ok(Self {
             // Keep reqwest's environment proxy support for every source request.
+            // The system's root certificates are trusted as well as the bundled
+            // ones (Cargo feature rustls-tls-native-roots): a company proxy that
+            // re-signs HTTPS installs its root there. Verification stays on, and
+            // release content is still checked by sha256.
             // A redirect off the Hands host is never followed: release
             // selection only comes from Hands, and a network filter that
             // answers for Hands is reported by its exact redirect instead.

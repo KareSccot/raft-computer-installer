@@ -37,6 +37,9 @@ fn download_failure(label: &str, release: &Release, error: crate::Error) -> crat
     let host = url.host_str().unwrap_or_default().to_owned();
     let cause = match &error {
         crate::Error::Http(error) if error.is_timeout() => "the download timed out".into(),
+        crate::Error::Http(error) if crate::source::certificate_rejected(error) => {
+            crate::source::CERTIFICATE_REJECTED.into()
+        }
         crate::Error::Http(error) if error.is_connect() => "the connection failed".into(),
         crate::Error::Http(error) if error.is_redirect() => "it redirected too many times".into(),
         crate::Error::Http(_) => "the download failed".into(),
