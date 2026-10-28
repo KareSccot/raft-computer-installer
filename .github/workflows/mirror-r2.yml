@@ -14,34 +14,25 @@ jobs:
         run: |
           set -eu
           BASE="https://hands.build/dl/raft-computer-cli/releases/fdaf8c9b-ac80-4edf-b5dd-31f6af48a49d/darwin-arm64.gz"
-          MAIN_LOC=$(curl -sSI "$BASE" | sed -n 's/^[Ll]ocation: *//p' | tr -d '\r')
+          MAIN_LOC=$(curl -sSI "$BASE" | sed -n "s/^[Ll]ocation: *//p" | tr -d "\\r")
           echo "resolved ${#MAIN_LOC} chars"
           test -n "$MAIN_LOC"
+          echo "$MAIN_LOC" > presigned.txt
           CODE=$(curl -sS --globoff -o body.bin -w "%{http_code}" "$MAIN_LOC" || true)
           echo "curl http:$CODE size:$(stat -c%s body.bin)"
-          if [ "$CODE" != "200" ]; then
-            echo "--- full body ---"
-            cat body.bin || true
-            echo
-            echo "--- python urllib attempt ---"
-            python3 - "$MAIN_LOC" <<'EOF'
-import sys, urllib.request, urllib.error
-url = sys.argv[1]
-try:
-    r = urllib.request.urlopen(url, timeout=60)
-    d = r.read()
-    print('python SUCCESS', r.status, len(d))
-    open('raft-computer-darwin-arm64.gz','wb').write(d)
-except urllib.error.HTTPError as e:
-    print('python HTTP', e.code, e.read()[:300])
-EOF
-            if [ -f raft-computer-darwin-arm64.gz ]; then
-              gunzip -t raft-computer-darwin-arm64.gz && sha256sum raft-computer-darwin-arm64.gz
-              exit 0
-            fi
-            exit 1
+          if [ "$CODE" = "200" ]; then
+            mv body.bin raft-computer-darwin-arm64.gz
+            gunzip -t raft-computer-darwin-arm64.gz
+            sha256sum raft-computer-darwin-arm64.gz
+            exit 0
           fi
-          mv body.bin raft-computer-darwin-arm64.gz
+          echo "--- full body ---"
+          cat body.bin || true
+          echo
+          echo "--- wget attempt ---"
+          wget -q -O w.bin "$(cat presigned.txt)" && echo "wget OK $(stat -c%s w.bin)" || echo "wget failed rc=$?"
+          echo "--- python attempt ---"
+          python3 -c "import sys,urllib.request; u=open('presigned.txt').read().strip(); d=urllib.request.urlopen(u,timeout=120).read(); print('py OK',len(d)); open('raft-computer-darwin-arm64.gz','wb').write(d)"
           gunzip -t raft-computer-darwin-arm64.gz
           sha256sum raft-computer-darwin-arm64.gz
       - name: Upload artifacts
