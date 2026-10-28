@@ -24,7 +24,7 @@ verification-fixture = []
 k-carrier = "=0.3.4"
 async-trait = "0.1"
 libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "system-proxy", "stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "stream", "json"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,7 +32,12 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 
+# The macOS system proxy; Windows Internet Settings are parsed in rust/proxy.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["system-proxy"] }
+
 [target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
 
 [profile.release]

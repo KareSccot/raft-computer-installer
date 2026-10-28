@@ -10,6 +10,7 @@ pub mod host;
 pub mod operation;
 pub mod presence;
 pub mod process;
+mod proxy;
 pub mod report;
 pub mod request;
 pub mod runner;
