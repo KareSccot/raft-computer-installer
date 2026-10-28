@@ -13,9 +13,10 @@ jobs:
       - name: Download artifacts from R2
         run: |
           set -eu
-          # Resolve fresh presigned URLs from hands.build (public redirect)
-          MAIN_LOC=$(curl -sSI "https://hands.build/dl/raft-computer-cli/releases/fdaf8c9b-ac80-4edf-b5dd-31f6af48a49d/darwin-arm64.gz" | awk "tolower($0)~/^location:/{print $2}" | tr -d "\r")
-          echo "main presigned: ${MAIN_LOC:0:80}..."
+          BASE="https://hands.build/dl/raft-computer-cli/releases/fdaf8c9b-ac80-4edf-b5dd-31f6af48a49d/darwin-arm64.gz"
+          MAIN_LOC=$(curl -sSI "$BASE" | sed -n 's/^[Ll]ocation: *//p' | tr -d '\r')
+          echo "resolved ${#MAIN_LOC} chars"
+          test -n "$MAIN_LOC"
           curl -sS --retry 3 -o raft-computer-darwin-arm64.gz "$MAIN_LOC" -w "http:%{http_code} size:%{size_download}\n"
           gunzip -t raft-computer-darwin-arm64.gz
           sha256sum raft-computer-darwin-arm64.gz
