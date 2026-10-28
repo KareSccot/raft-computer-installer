@@ -1225,7 +1225,11 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
             } else {
                 "The requested Raft Computer release could not be resolved.".into()
             });
-            result.detail.insert("diagnostic".into(), error.to_string());
+            let diagnostic = match source.roots_fallback() {
+                Some(fallback) => format!("{error}; {fallback}"),
+                None => error.to_string(),
+            };
+            result.detail.insert("diagnostic".into(), diagnostic);
             result.preserve_unresolved(unresolved);
             return Ok(Reply::receipt(result.finish(cfg)?));
         }
@@ -1298,6 +1302,9 @@ pub async fn execute(cfg: &Config, request: &Request) -> Result<Reply> {
         next_step: None,
         detail: BTreeMap::new(),
     };
+    if let Some(fallback) = source.roots_fallback() {
+        plan.detail.insert("tlsRoots".into(), fallback.to_owned());
+    }
     if plan.kind == Kind::Repair && exists(&active_path(cfg))? {
         mark_damage(cfg)?;
     }

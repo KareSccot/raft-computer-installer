@@ -37,6 +37,9 @@ fn download_failure(label: &str, release: &Release, error: crate::Error) -> crat
     let host = url.host_str().unwrap_or_default().to_owned();
     let cause = match &error {
         crate::Error::Http(error) if error.is_timeout() => "the download timed out".into(),
+        crate::Error::Http(error) if crate::source::certificate_rejected(error) => {
+            crate::source::CERTIFICATE_REJECTED.into()
+        }
         crate::Error::Http(error) if error.is_connect() => "the connection failed".into(),
         crate::Error::Http(error) if error.is_redirect() => "it redirected too many times".into(),
         crate::Error::Http(_) => "the download failed".into(),
@@ -409,7 +412,7 @@ pub async fn acquire_sidecar(cfg: &Config, manifest: &Manifest) -> Result<Option
             let path = dir.join(SIDECAR_NAME);
             if !fs::read(&path).is_ok_and(|bytes| verify(&bytes, identity).is_ok()) {
                 let bytes = download(
-                    &Downloader::new()?,
+                    &crate::source::downloader()?,
                     release,
                     &dir,
                     "Raft Computer support file",
@@ -440,7 +443,7 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
     ensure_dir(&scratch)?;
     let sidecar = acquire_sidecar(cfg, manifest).await?;
     let bytes = download(
-        &Downloader::new()?,
+        &crate::source::downloader()?,
         &manifest.release,
         &scratch,
         "Raft Computer",
@@ -477,7 +480,7 @@ pub async fn acquire(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifa
 pub async fn acquire_repair(cfg: &Config, manifest: &Manifest) -> Result<PreparedArtifact> {
     version::exact(&manifest.version)?;
     ensure_dir(&cfg.scratch())?;
-    let downloader = Downloader::new()?;
+    let downloader = crate::source::downloader()?;
     let bytes = download(
         &downloader,
         &manifest.release,
