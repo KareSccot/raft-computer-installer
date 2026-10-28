@@ -521,10 +521,23 @@ mod native {
         },
     };
 
+    /// A process that exits while /proc is read reports ESRCH instead of
+    /// NotFound; either way it is gone.
+    fn exited(e: &std::io::Error) -> bool {
+        e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn a_process_exiting_mid_read_counts_as_exited() {
+        assert!(exited(&std::io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(exited(&std::io::ErrorKind::NotFound.into()));
+        assert!(!exited(&std::io::ErrorKind::PermissionDenied.into()));
+    }
+
     fn read_stat(pid: u32) -> Result<Option<String>> {
         let text = match fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if exited(&e) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         let fields = text
@@ -561,7 +574,7 @@ mod native {
         match fs::metadata(&root) {
             Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => return Ok(None),
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if exited(&e) => return Ok(None),
             Err(e) => return Err(e.into()),
         }
         let Some(created) = read_stat(pid)? else {
@@ -578,12 +591,7 @@ mod native {
             // example a non-dumpable PAM session). They are not identifiable
             // installation candidates. Recorded identities remain fail-closed:
             // matches() separately requires proof of exit when observe is None.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
+            Err(e) if exited(&e) || e.kind() == std::io::ErrorKind::PermissionDenied => {
                 return Ok(None);
             }
             Err(e) => return Err(e.into()),
