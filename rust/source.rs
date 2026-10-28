@@ -105,6 +105,7 @@ pub struct Source {
     client: Client,
     hands_origin: Url,
     hands_app: String,
+    roots_fallback: Option<String>,
 }
 
 fn base_url(value: &str) -> Result<Url> {
@@ -169,6 +170,60 @@ fn network_redirect(origin: &Url, requested: &Url, status: u16, target: &Url) ->
     ))
 }
 
+pub(crate) const SYSTEM_ROOTS_UNUSABLE: &str =
+    "system certificate store unreadable; using bundled roots";
+
+/// The system's root certificates are trusted as well as the bundled ones
+/// (Cargo feature rustls-tls-native-roots): a company proxy that re-signs
+/// HTTPS installs its root there. Verification stays on, and release content
+/// is still checked by sha256. Turning them off leaves the bundled roots.
+pub(crate) fn trusting(builder: reqwest::ClientBuilder, native: bool) -> reqwest::ClientBuilder {
+    builder.tls_built_in_native_certs(native)
+}
+
+/// Build with the system's roots first. A system store whose certificates
+/// cannot be used fails the build; then build again with the bundled roots
+/// only, as before system roots were trusted, and say why.
+pub(crate) fn build_with_roots<E: std::fmt::Display>(
+    build: impl Fn(bool) -> std::result::Result<Client, E>,
+) -> std::result::Result<(Client, Option<String>), E> {
+    match build(true) {
+        Ok(client) => Ok((client, None)),
+        Err(native) => {
+            let client = build(false)?;
+            Ok((client, Some(format!("{SYSTEM_ROOTS_UNUSABLE} ({native})"))))
+        }
+    }
+}
+
+/// An error and its causes on one line: reqwest's own message is only "builder error".
+fn causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut line = error.to_string();
+    let mut cause = error.source();
+    while let Some(current) = cause {
+        line.push_str(": ");
+        line.push_str(&current.to_string());
+        cause = current.source();
+    }
+    line
+}
+
+/// k-carrier's downloader, with the same roots as release requests.
+pub fn downloader() -> Result<k_carrier::artifact::Downloader> {
+    let (client, _) = build_with_roots(|native| {
+        // As k_carrier::artifact::Downloader::new, apart from the roots.
+        trusting(reqwest::Client::builder(), native)
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .map_err(|error| causes(&error))
+    })
+    .map_err(invalid)?;
+    Ok(k_carrier::artifact::Downloader {
+        client,
+        policy: Default::default(),
+    })
+}
+
 pub(crate) const CERTIFICATE_REJECTED: &str = "its HTTPS certificate is not trusted on this computer; a company proxy may be re-signing HTTPS";
 
 /// TLS rejected the server's certificate. rustls is not a direct dependency,
@@ -211,30 +266,40 @@ impl Source {
         }
         let hands_origin = base_url(&cfg.hands_origin)?;
         let hands_host = hands_origin.host_str().map(str::to_owned);
-        Ok(Self {
-            // Keep reqwest's environment proxy support for every source request.
-            // The system's root certificates are trusted as well as the bundled
-            // ones (Cargo feature rustls-tls-native-roots): a company proxy that
-            // re-signs HTTPS installs its root there. Verification stays on, and
-            // release content is still checked by sha256.
-            // A redirect off the Hands host is never followed: release
-            // selection only comes from Hands, and a network filter that
-            // answers for Hands is reported by its exact redirect instead.
-            client: Client::builder()
+        // Keep reqwest's environment proxy support for every source request.
+        // A redirect off the Hands host is never followed: release
+        // selection only comes from Hands, and a network filter that
+        // answers for Hands is reported by its exact redirect instead.
+        let (client, roots_fallback) = build_with_roots(|native| {
+            trusting(Client::builder(), native)
                 .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                    if attempt.url().host_str() != hands_host.as_deref() {
-                        attempt.stop()
-                    } else if attempt.previous().len() > 5 {
-                        attempt.error("too many redirects")
-                    } else {
-                        attempt.follow()
+                .redirect(reqwest::redirect::Policy::custom({
+                    let hands_host = hands_host.clone();
+                    move |attempt| {
+                        if attempt.url().host_str() != hands_host.as_deref() {
+                            attempt.stop()
+                        } else if attempt.previous().len() > 5 {
+                            attempt.error("too many redirects")
+                        } else {
+                            attempt.follow()
+                        }
                     }
                 }))
-                .build()?,
+                .build()
+                .map_err(|error| causes(&error))
+        })
+        .map_err(invalid)?;
+        Ok(Self {
+            client,
             hands_origin,
             hands_app: cfg.hands_app.clone(),
+            roots_fallback,
         })
+    }
+
+    /// Why the system's root certificates are not in use, when they are not.
+    pub fn roots_fallback(&self) -> Option<&str> {
+        self.roots_fallback.as_deref()
     }
 
     async fn json<T: serde::de::DeserializeOwned>(&self, url: Url) -> Result<T> {
@@ -489,5 +554,49 @@ mod shown_url_tests {
         assert!(!is_network_redirect(&invalid(
             "release source returned HTTP 404"
         )));
+    }
+}
+
+#[cfg(test)]
+mod roots_tests {
+    use super::*;
+
+    #[test]
+    fn unusable_system_roots_fall_back_to_bundled_roots_and_say_why() {
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let (_client, fallback) = build_with_roots(|native| {
+            attempts.borrow_mut().push(native);
+            if native {
+                Err("zero valid certificates found in native root store")
+            } else {
+                Ok(trusting(Client::builder(), false).build().unwrap())
+            }
+        })
+        .unwrap();
+        assert_eq!(*attempts.borrow(), [true, false]);
+        assert_eq!(
+            fallback.as_deref(),
+            Some(
+                "system certificate store unreadable; using bundled roots (zero valid certificates found in native root store)"
+            )
+        );
+    }
+
+    #[test]
+    fn usable_system_roots_are_used_without_a_second_build() {
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let (_client, fallback) = build_with_roots(|native| {
+            attempts.borrow_mut().push(native);
+            trusting(Client::builder(), native).build()
+        })
+        .unwrap();
+        assert_eq!(*attempts.borrow(), [true]);
+        assert_eq!(fallback, None);
+    }
+
+    #[test]
+    fn a_failing_bundled_build_still_fails() {
+        let result = build_with_roots(|_| Err::<Client, _>("broken"));
+        assert!(matches!(result, Err("broken")));
     }
 }
