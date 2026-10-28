@@ -32,11 +32,8 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync"] }
 uuid = { version = "1", features = ["v4"] }
 
-# The macOS system proxy; Windows Internet Settings are parsed in rust/proxy.rs.
-[target.'cfg(target_os = "macos")'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["system-proxy"] }
-
 [target.'cfg(windows)'.dependencies]
+# Internet Settings proxy, parsed in rust/proxy.rs.
 windows-registry = "0.6"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
 

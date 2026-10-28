@@ -1,17 +1,16 @@
 //! The proxy every installer client uses.
 //!
 //! Proxies come from HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY (either case)
-//! as reqwest reads them. When none of those is set, the system proxy that
-//! browsers and the PowerShell bootstrap use applies too:
-//! - macOS: reqwest's `system-proxy` feature (a macOS-only dependency in
-//!   Cargo.toml) reads the SystemConfiguration HTTP/HTTPS proxies.
-//! - Windows: Internet Settings in the registry, read and parsed here.
-//!   reqwest's own reader takes `ProxyServer` as one URL, so the
-//!   per-protocol form `https=proxy:443` became the proxy host "https=proxy"
-//!   and the connection failed.
+//! as reqwest reads them. On Windows, when none of the proxy variables is
+//! set, the manual proxy in Internet Settings (the one browsers and the
+//! PowerShell bootstrap use) applies too. reqwest's own `system-proxy`
+//! reader is not used: it takes `ProxyServer` as one URL, so the
+//! per-protocol form `https=proxy:443` became the proxy host "https=proxy".
 //!
-//! A system value that cannot be used means a direct connection, as before
-//! the system proxy was read.
+//! Every Windows setting this cannot follow exactly (a PAC script,
+//! auto-detect, a machine-wide policy, a value that does not parse) means a
+//! direct connection, which is what 0.3.23 and earlier did. macOS and Linux
+//! read the environment only, as before.
 // Parsing is used on Windows and tested everywhere.
 #![cfg_attr(not(windows), allow(dead_code))]
 
@@ -42,22 +41,92 @@ fn env_proxy_set(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
 
 #[cfg(windows)]
 fn system(builder: ClientBuilder) -> ClientBuilder {
-    let Ok(settings) = windows_registry::CURRENT_USER
-        .open("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
-    else {
+    const SETTINGS: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+    let Ok(user) = windows_registry::CURRENT_USER.open(SETTINGS) else {
         return builder;
     };
-    if settings.get_u32("ProxyEnable").unwrap_or(0) == 0 {
-        return builder;
+    let settings = WindowsSettings {
+        proxy_enable: user.get_u32("ProxyEnable").unwrap_or(0),
+        proxy_server: user.get_string("ProxyServer").unwrap_or_default(),
+        proxy_override: user.get_string("ProxyOverride").unwrap_or_default(),
+        auto_config_url: user.get_string("AutoConfigURL").unwrap_or_default(),
+        connection_flags: user
+            .open("Connections")
+            .and_then(|connections| connections.get_value("DefaultConnectionSettings"))
+            .ok()
+            .and_then(|value| connection_flags(&value)),
+        per_user_policy: windows_registry::LOCAL_MACHINE
+            .open("Software\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+            .and_then(|policy| policy.get_u32("ProxySettingsPerUser"))
+            .ok(),
+    };
+    let env_no_proxy = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    match windows_selection(&settings, &env_no_proxy) {
+        Some(proxies) => apply(builder, &proxies),
+        None => builder,
     }
-    let server = settings.get_string("ProxyServer").unwrap_or_default();
-    let overrides = settings.get_string("ProxyOverride").unwrap_or_default();
-    apply(builder, &windows_proxies(&server, &overrides))
 }
 
 #[cfg(not(windows))]
 fn system(builder: ClientBuilder) -> ClientBuilder {
     builder
+}
+
+/// The Internet Settings values that decide the proxy.
+#[derive(Debug, Default)]
+pub(crate) struct WindowsSettings {
+    pub proxy_enable: u32,
+    pub proxy_server: String,
+    pub proxy_override: String,
+    pub auto_config_url: String,
+    /// Flags from `Connections\DefaultConnectionSettings` (bytes 8..12).
+    pub connection_flags: Option<u32>,
+    /// HKLM policy `ProxySettingsPerUser`; 0 means the machine settings apply.
+    pub per_user_policy: Option<u32>,
+}
+
+const PROXY_TYPE_AUTO_PROXY_URL: u32 = 0x04;
+const PROXY_TYPE_AUTO_DETECT: u32 = 0x08;
+
+fn connection_flags(value: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(value.get(8..12)?.try_into().ok()?))
+}
+
+/// The manual proxy to use, or `None` for a direct connection.
+///
+/// Only a manual proxy that WinINET itself would use first is followed. A PAC
+/// script (`AutoConfigURL`, or the auto-config flag) and auto-detect (WPAD)
+/// take precedence over `ProxyServer` in WinINET and may well say DIRECT, and
+/// a machine-wide policy means these per-user values are not in effect, so
+/// all of those go direct, as before the system proxy was read. NO_PROXY
+/// from the environment is added to `ProxyOverride`.
+pub(crate) fn windows_selection(
+    settings: &WindowsSettings,
+    env_no_proxy: &str,
+) -> Option<WindowsProxies> {
+    let auto = settings.connection_flags.unwrap_or(0)
+        & (PROXY_TYPE_AUTO_PROXY_URL | PROXY_TYPE_AUTO_DETECT);
+    if settings.proxy_enable == 0
+        || settings.per_user_policy == Some(0)
+        || !settings.auto_config_url.trim().is_empty()
+        || auto != 0
+    {
+        return None;
+    }
+    let mut proxies = windows_proxies(&settings.proxy_server, &settings.proxy_override);
+    if proxies.http.is_none() && proxies.https.is_none() {
+        return None;
+    }
+    let env_no_proxy = env_no_proxy.trim();
+    if !env_no_proxy.is_empty() {
+        if !proxies.no_proxy.is_empty() {
+            proxies.no_proxy.push(',');
+        }
+        proxies.no_proxy.push_str(env_no_proxy);
+    }
+    Some(proxies)
 }
 
 /// The proxies a Windows `ProxyServer` / `ProxyOverride` pair selects.
@@ -289,6 +358,73 @@ mod tests {
         assert_eq!(windows_proxies("p:80", "*corp*;a.*.b;300.*;;").no_proxy, "");
     }
 
+    fn manual(server: &str) -> WindowsSettings {
+        WindowsSettings {
+            proxy_enable: 1,
+            proxy_server: server.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_manual_proxy_is_followed() {
+        assert_eq!(
+            windows_selection(&manual("https=b:443"), ""),
+            Some(proxies(None, Some("http://b:443"), ""))
+        );
+        let settings = WindowsSettings {
+            proxy_override: "*.corp".into(),
+            connection_flags: Some(0x01 | 0x02),
+            per_user_policy: Some(1),
+            ..manual("p:80")
+        };
+        assert_eq!(
+            windows_selection(&settings, " hands.build ")
+                .unwrap()
+                .no_proxy,
+            ".corp,hands.build"
+        );
+    }
+
+    #[test]
+    fn anything_but_a_usable_manual_proxy_goes_direct() {
+        let direct = [
+            WindowsSettings {
+                proxy_enable: 0,
+                ..manual("p:80")
+            },
+            WindowsSettings {
+                auto_config_url: "http://wpad/proxy.pac".into(),
+                ..manual("p:80")
+            },
+            WindowsSettings {
+                connection_flags: Some(0x02 | 0x04),
+                ..manual("p:80")
+            },
+            WindowsSettings {
+                connection_flags: Some(0x02 | 0x08),
+                ..manual("p:80")
+            },
+            WindowsSettings {
+                per_user_policy: Some(0),
+                ..manual("p:80")
+            },
+            manual("socks=s:1080"),
+            manual(""),
+        ];
+        for settings in direct {
+            assert_eq!(windows_selection(&settings, ""), None, "{settings:?}");
+        }
+    }
+
+    #[test]
+    fn connection_flags_come_from_bytes_8_to_12() {
+        let mut value = vec![0x46, 0, 0, 0, 7, 0, 0, 0, 0x09, 0, 0, 0, 0, 0];
+        assert_eq!(connection_flags(&value), Some(0x09));
+        value.truncate(10);
+        assert_eq!(connection_flags(&value), None);
+    }
+
     #[test]
     fn any_proxy_variable_keeps_the_system_proxy_out() {
         let set = |names: &'static [&'static str]| {
@@ -307,8 +443,22 @@ mod tests {
     async fn the_parsed_https_proxy_receives_the_connect() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
         let seen = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    }
+                    Err(_) => return String::new(),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             let mut byte = [0_u8; 1];
             while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
@@ -321,7 +471,12 @@ mod tests {
         let client = apply(reqwest::Client::builder().no_proxy(), &parsed)
             .build()
             .unwrap();
-        assert!(client.get("https://hands.example/").send().await.is_err());
+        let response = client
+            .get("https://hands.example/")
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+        assert!(response.is_err());
         assert!(
             seen.join()
                 .unwrap()
