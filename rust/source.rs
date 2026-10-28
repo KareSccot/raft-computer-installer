@@ -266,7 +266,10 @@ impl Source {
         }
         let hands_origin = base_url(&cfg.hands_origin)?;
         let hands_host = hands_origin.host_str().map(str::to_owned);
-        // Keep reqwest's environment proxy support for every source request.
+        // Proxies come from HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY and, for
+        // each of those left unset, from the Windows Internet Settings or
+        // macOS system proxy (Cargo feature system-proxy), as browsers and
+        // the PowerShell bootstrap already do.
         // A redirect off the Hands host is never followed: release
         // selection only comes from Hands, and a network filter that
         // answers for Hands is reported by its exact redirect instead.
