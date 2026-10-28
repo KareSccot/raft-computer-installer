@@ -17,10 +17,22 @@ jobs:
           MAIN_LOC=$(curl -sSI "$BASE" | sed -n 's/^[Ll]ocation: *//p' | tr -d '\r')
           echo "resolved ${#MAIN_LOC} chars"
           test -n "$MAIN_LOC"
-          curl -sS --retry 3 -o raft-computer-darwin-arm64.gz "$MAIN_LOC" -w "http:%{http_code} size:%{size_download}\n"
+          CODE=$(curl -sS --retry 2 -o body.bin -w "%{http_code}" "$MAIN_LOC" || true)
+          echo "http:$CODE size:$(stat -c%s body.bin)"
+          if [ "$CODE" != "200" ]; then
+            echo "--- body head ---"
+            head -c 800 body.bin || true
+            echo
+            echo "--- try without query / with UA ---"
+            curl -sS -A "raft-computer-installer/0.3.22" -o body2.bin -w "with-UA http:%{http_code}\n" "$MAIN_LOC" || true
+            head -c 400 body2.bin || true
+            exit 1
+          fi
+          mv body.bin raft-computer-darwin-arm64.gz
           gunzip -t raft-computer-darwin-arm64.gz
           sha256sum raft-computer-darwin-arm64.gz
       - name: Upload artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: r2-mirror
