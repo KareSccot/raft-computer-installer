@@ -385,6 +385,9 @@ class Machine:
             RAFT_COMPUTER_INSTALL_DIR=str(self.install_dir), RAFT_COMPUTER_RELEASE_BASE=self.server.base + "/computer",
             RAFT_COMPUTER_HANDS_ORIGIN=self.server.base, RAFT_COMPUTER_NON_INTERACTIVE="1", RAFT_COMPUTER_NO_MODIFY_PATH="1" if WINDOWS else "0",
             RAFT_COMPUTER_INSTALLER_DL_BASE=self.server.base + "/dl/raft-computer-installer")
+        # The fixture is on loopback. A Windows or macOS system proxy would
+        # otherwise apply, since no proxy variable is set (system-proxy).
+        environment.update(NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
         environment.update(extra or {})
         # None in `extra` removes a setting, exercising the installer default.
         return {key: value for key, value in environment.items() if value is not None}
