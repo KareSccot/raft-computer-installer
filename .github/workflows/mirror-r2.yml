@@ -17,15 +17,28 @@ jobs:
           MAIN_LOC=$(curl -sSI "$BASE" | sed -n 's/^[Ll]ocation: *//p' | tr -d '\r')
           echo "resolved ${#MAIN_LOC} chars"
           test -n "$MAIN_LOC"
-          CODE=$(curl -sS --retry 2 -o body.bin -w "%{http_code}" "$MAIN_LOC" || true)
-          echo "http:$CODE size:$(stat -c%s body.bin)"
+          CODE=$(curl -sS --globoff -o body.bin -w "%{http_code}" "$MAIN_LOC" || true)
+          echo "curl http:$CODE size:$(stat -c%s body.bin)"
           if [ "$CODE" != "200" ]; then
-            echo "--- body head ---"
-            head -c 800 body.bin || true
+            echo "--- full body ---"
+            cat body.bin || true
             echo
-            echo "--- try without query / with UA ---"
-            curl -sS -A "raft-computer-installer/0.3.22" -o body2.bin -w "with-UA http:%{http_code}\n" "$MAIN_LOC" || true
-            head -c 400 body2.bin || true
+            echo "--- python urllib attempt ---"
+            python3 - "$MAIN_LOC" <<'EOF'
+import sys, urllib.request, urllib.error
+url = sys.argv[1]
+try:
+    r = urllib.request.urlopen(url, timeout=60)
+    d = r.read()
+    print('python SUCCESS', r.status, len(d))
+    open('raft-computer-darwin-arm64.gz','wb').write(d)
+except urllib.error.HTTPError as e:
+    print('python HTTP', e.code, e.read()[:300])
+EOF
+            if [ -f raft-computer-darwin-arm64.gz ]; then
+              gunzip -t raft-computer-darwin-arm64.gz && sha256sum raft-computer-darwin-arm64.gz
+              exit 0
+            fi
             exit 1
           fi
           mv body.bin raft-computer-darwin-arm64.gz
